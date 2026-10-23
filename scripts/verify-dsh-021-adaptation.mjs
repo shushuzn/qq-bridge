@@ -44,6 +44,8 @@ import { discoverDshSessionCookie, NodeApiClient, unwrap } from '../src/dsh-clie
 const ROOT = process.cwd();
 const DSH_MODULES = dshModulesDir();
 const DSH_HOME = path.join(os.homedir(), '.dsh');
+// 本机实际在用的 profile 未必是 web（桌面版 = desktop）；用 DSH_PROFILE 覆盖。
+const PROFILE = process.env.DSH_PROFILE || 'web';
 const BASE = process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
 
 let pass = 0, fail = 0;
@@ -64,9 +66,25 @@ const persona = await import(pathToFileURL(path.join(DSH_MODULES, '@deepseek-ai/
 const YAML = await import(pathToFileURL(path.join(DSH_MODULES, 'js-yaml/index.js')).href);
 const yaml = YAML.default ?? YAML;
 
+// 模块树版本闸门：dshModulesDir() 在 profile 的 node_modules 里找不到
+// @deepseek-ai/dsh-persona（0.1.7 起 bundle 由 app.asar 提供），Node 解析会一路
+// 冒泡到 npm 全局安装的旧版 dsh CLI（本机实测 0.1.0-rc.6），它的 persona schema
+// 与运行中的 0.2.1-rc.2 不是一套口径。这时静态校验没有意义——运行时适配由 §5 的
+// session/create + 真跑一回合覆盖，所以显式记为跳过，而不是输出假失败。
+let personaPkgVersion = '';
+try {
+  const personaEntry = path.join(DSH_MODULES, '@deepseek-ai/dsh-persona/lib/index.js');
+  personaPkgVersion = JSON.parse(fs.readFileSync(path.resolve(path.dirname(personaEntry), '..', 'package.json'), 'utf8')).version;
+} catch {}
+const PERSONA_TREE_OK = /^0\.2\./.test(personaPkgVersion);
+
 let oldRejected = false;
 try { persona.Config({ text: 'x' }); } catch { oldRejected = true; }
-check('dsh-persona 仍拒绝旧字段 text（故障前提成立）', oldRejected);
+if (!PERSONA_TREE_OK) {
+  skip('dsh-persona 仍拒绝旧字段 text（故障前提成立）', '模块树 dsh-persona ' + (personaPkgVersion || '(未知)') + ' 非 0.2.x；运行中为 0.2.1-rc.2，口径不同，改由 §5 运行时证据覆盖');
+} else {
+  check('dsh-persona 仍拒绝旧字段 text（故障前提成立）', oldRejected);
+}
 
 /** DSH 0.2.1 的 agent loop 只注册这两个提示词变量（0.2.0 还有 `cwd`）。 */
 const DSH_PROMPT_VARIABLES = new Set(['provider', 'model']);
@@ -76,7 +94,11 @@ for (const p of ['qq-chat', 'qq-chat-v2']) {
   const row = yaml.load(fs.readFileSync(f, 'utf8')).find((r) => r.id === 'persona');
   let schemaOk = false;
   try { persona.Config(row.config); schemaOk = true; } catch {}
-  check(`preset ${p}: persona.config 通过 DSH schema`, schemaOk);
+  if (!PERSONA_TREE_OK) {
+    skip(`preset ${p}: persona.config 通过 DSH schema`, '模块树 dsh-persona ' + (personaPkgVersion || '?') + ' 非 0.2.x，schema 口径与运行中的 0.2.1-rc.2 不同；session/create 实测已装载该 preset');
+  } else {
+    check(`preset ${p}: persona.config 通过 DSH schema`, schemaOk);
+  }
   // 未知变量不是"渲染成空"而是 fail loud：回合直接 error、模型一次都不跑。
   // 所以这里必须钉住「只用 DSH 真注册过的变量」，而不只是「有 {{model}}」。
   const usedVars = [...new Set([...JSON.stringify(row.config).matchAll(/\{\{([a-z][a-z0-9_]*)\}\}/g)].map((m) => m[1]))];
@@ -166,13 +188,18 @@ const { collectDshToolNames } = await import(pathToFileURL(path.join(ROOT, 'scri
 const scanned = collectDshToolNames();
 if (scanned.names.size === 0) {
   skip('守卫名单与 DSH 真实工具名对账', '未扫到任何 DSH 包（DSH 未安装？）');
+} else if (!PERSONA_TREE_OK) {
+  // 扫描器与 persona 校验共用 dshModulesDir()，扫到的同样是 npm 全局旧 CLI 的包，
+  // 其工具集比运行中的 0.2.1-rc.2 旧（缺 terminal_*/session_*/team_task_*/plugin_market 等），
+  // 会把 0.2.1 的真实工具名误判成"拼写的假名"。
+  skip('守卫名单与 DSH 真实工具名对账', '扫描源 dsh-persona ' + (personaPkgVersion || '?') + ' 非 0.2.x，工具集比运行中的 0.2.1-rc.2 旧，会误报真实工具名');
 } else {
   const fabricated = [...guardNames]
     .filter((n) => !n.startsWith('dev_') && !optionalNames.has(n) && !scanned.names.has(n));
   check('守卫名单无拼错的假名（restrict 不会静默失效）', fabricated.length === 0, fabricated.join(', ') || `扫过 ${scanned.packages.length} 个包`);
 }
 
-const patch = fs.readFileSync(path.join(DSH_HOME, 'profiles/web/cordis.patch.yml'), 'utf8');
+const patch = fs.readFileSync(path.join(DSH_HOME, 'profiles', PROFILE, 'cordis.patch.yml'), 'utf8');
 const patchDoc = yaml.load(patch);
 const mcpIds = patchDoc.filter((e) => e?.insert).flatMap((e) => e.insert.map((x) => x.id));
 check('profile patch 含 3 个 MCP 且无重复', mcpIds.length === 3 && new Set(mcpIds).size === 3, mcpIds.join(', '));
@@ -180,17 +207,18 @@ const snowlumaEntry = patchDoc.filter((e) => e?.insert).flatMap((e) => e.insert)
 check('mcp-snowluma 带 toolCallTimeoutMs=725000', snowlumaEntry?.config?.toolCallTimeoutMs === 725000);
 check('mcp 路径指向本仓库', mcpIds.every((id) => {
   const e = patchDoc.filter((x) => x?.insert).flatMap((x) => x.insert).find((y) => y.id === id);
-  return String(e.config.args[0]).includes('qq-bridge');
+  // 同一 profile 里可能还有别的 MCP 条目（如 dsh-mcp-connector 的 url 型，无 args），不能假定一定有 args。
+  return String(e?.config?.args?.[0] ?? '').includes('qq-bridge');
 }));
 
-const pkg = JSON.parse(fs.readFileSync(path.join(DSH_HOME, 'profiles/web/package.json'), 'utf8'));
+const pkg = JSON.parse(fs.readFileSync(path.join(DSH_HOME, 'profiles', PROFILE, 'package.json'), 'utf8'));
 check('profile bundles 含 qq-mode-console', pkg.dsh.profile.bundles.includes('qq-mode-console'));
 check('qq-mode-console link 依赖已注册', String(pkg.dependencies['qq-mode-console'] ?? '').startsWith('link:'));
-check('qq-mode-console 已 link 进 node_modules', fs.existsSync(path.join(DSH_HOME, 'profiles/web/node_modules/qq-mode-console')));
+check('qq-mode-console 已 link 进 node_modules', fs.existsSync(path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules/qq-mode-console')));
 
 // ── 3. 仓库配置：模型 ───────────────────────────────────────────────────────
 const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
-check('config.json dsh.model = deepseek-flash', cfg.dsh?.model === 'deepseek-flash', `当前 ${cfg.dsh?.model}`);
+check('config.json 指定了 provider/model（用户选择，不再硬编码 deepseek-flash）', typeof cfg.dsh?.provider === 'string' && typeof cfg.dsh?.model === 'string', `当前 ${cfg.dsh?.provider}/${cfg.dsh?.model}`);
 const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src/bridge.js'), 'utf8');
 // 只看可执行代码，忽略注释（注释里会提到旧名做历史说明）。
 // 注意必须按 /\r?\n/ 切行：JS 的 `.` 不匹配 \r，CRLF 文件直接 split('\n') 会让行尾留 \r，
@@ -262,7 +290,9 @@ async function rpc(e, a) {
 const st = await rpc('settings/describe', {});
 check('settings/describe 可用', st.ok === true);
 const dm = st.value?.namespaces?.find((n) => n.ns === 'agent-default-model');
-check('DSH 全局默认模型 = deepseek-flash', dm?.value?.model === 'deepseek-flash', `当前 ${dm?.value?.model}`);
+// 全局默认是用户偏好，不是适配项；桥接实际用的是 config.json 里的 provider/model。
+  const cfgModel = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8')).dsh;
+  check('DSH 全局默认模型可读（用户偏好，非适配项）', typeof dm?.value?.model === 'string', `全局=${dm?.value?.model} 桥接=${cfgModel.provider}/${cfgModel.model}`);
 const ap = await rpc('agentPresets/list', {});
 const presetIds = ap.value?.presets?.map((p) => p.id) ?? [];
 check('agentPresets/list 含 qq-chat 与 qq-chat-v2', presetIds.includes('qq-chat') && presetIds.includes('qq-chat-v2'), presetIds.join(', '));
@@ -309,10 +339,17 @@ try {
   const created = unwrap(await api.sessions.create({ cwd: probeDir, agentPreset: 'qq-chat-v2' }), 'session.create');
   probeSessionId = created.sessionId;
   check('session/create 挂 qq-chat-v2 preset 成功', typeof probeSessionId === 'string' && probeSessionId.length > 0, probeSessionId);
-  unwrap(await api.sessions.selectModel({
-    sessionId: probeSessionId, provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'max'
-  }), 'session.selectModel');
-  check('session/selectModel(deepseek-flash) 被接受', true);
+  // provider/model 从 config.json 读，而不是硬编码 deepseek-official/deepseek-flash：
+  // 硬编码会让「本机该 provider 没余额」这种账号问题伪装成适配失败，也测不到用户真实配置。
+  const probeModel = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8')).dsh;
+  // step 一族模型在 modelCatalog 里没有 efforts 字段（不接受任何 effort），
+  // 强行传会被 session/model-unavailable 拒。config 没配 effort 就不传。
+  const smArgs = { sessionId: probeSessionId, provider: probeModel.provider, model: probeModel.model };
+  if (probeModel.reasoningEffort) smArgs.reasoningEffort = probeModel.reasoningEffort;
+  let smErr = null;
+  try { unwrap(await api.sessions.selectModel(smArgs), 'session.selectModel'); }
+  catch (e) { smErr = e; }
+  check('session/selectModel(' + probeModel.model + ') 被接受', smErr === null, smErr ? String(smErr.message).slice(0, 120) : '');
 
   const projections = await api.callUnary('session/projections', { sessionId: probeSessionId });
   check('session/projections 一元 RPC 可用', projections.result?.ok === true,
@@ -393,7 +430,11 @@ try {
   try {
     const turnSession = unwrap(await api.sessions.create({ cwd: probeDir, agentPreset: 'qq-chat-v2' }), 'session.create(turn)');
     turnSessionId = turnSession.sessionId;
-    await api.sessions.selectModel({ sessionId: turnSessionId, provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'max' });
+    // 同 §5b：provider/model/effort 从 config.json 读，不硬编码（step 一族不接受 effort）。
+    const turnCfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8')).dsh;
+    const turnSm = { sessionId: turnSessionId, provider: turnCfg.provider, model: turnCfg.model };
+    if (turnCfg.reasoningEffort) turnSm.reasoningEffort = turnCfg.reasoningEffort;
+    await api.sessions.selectModel(turnSm);
     const turn = await new Promise((resolve) => {
       const socket = new WebSocket(url, { headers: { cookie: api.cookie } });
       const streamId = randomUUID();

@@ -33,6 +33,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { resolveFfmpeg } from './voice-core.js';
 
@@ -311,8 +312,34 @@ function runFfmpeg(ffmpeg, args, { timeoutMs = MEDIA_DEFAULTS.timeoutMs } = {}) 
   });
 }
 
+// 默认临时目录必须落在工作区内。
+//
+// 为什么不能再用 os.tmpdir()：MCP server（mcp-snowluma-safe.js）由 DSH 作为
+// stdio 子进程拉起，**继承 DSH 的文件沙箱**。DSH 的策略是 workspace-write 时，
+// 系统临时目录（C:\Users\<user>\AppData\Local\Temp）不在可写范围，
+// mkdtemp 直接 EPERM：
+//   EPERM: operation not permitted, mkdtemp '...\Temp\qqb-media-XXXXXX'
+// 结果是 qq_get_message_images / qq_get_sticker_image 全挂——模型一个字节都看不到，
+// 但采集/发表情仍然正常，表现为「能发不能看」这种极具误导性的半残状态。
+//
+// 解析顺序：QQB_MEDIA_TMP 覆盖 -> <仓库>/state/media-tmp（工作区内，默认）-> os.tmpdir()。
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function defaultTempRoot() {
+  const override = process.env.QQB_MEDIA_TMP;
+  if (override) return override;
+  try {
+    const dir = path.join(REPO_ROOT, 'state', 'media-tmp');
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  } catch {
+    // state/ 不可写时才退回系统临时目录（本地直接跑、没有沙箱的场景）。
+    return os.tmpdir();
+  }
+}
+
 function makeTempWorkspace(tmpDir) {
-  const base = tmpDir ? path.resolve(tmpDir) : os.tmpdir();
+  const base = tmpDir ? path.resolve(tmpDir) : defaultTempRoot();
   fs.mkdirSync(base, { recursive: true });
   return fs.mkdtempSync(path.join(base, 'qqb-media-'));
 }
